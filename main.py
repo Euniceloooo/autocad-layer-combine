@@ -27,6 +27,11 @@ except ImportError:
 SUFFIX_RE = re.compile(r"^(TLC\d+)$", re.IGNORECASE)
 ORIGIN_LAYER = "ORIGIN_MARK"
 ACAD_COLOR_RED = 1
+BUILD_ID = "com-retry-4"
+# AutoCAD busy / not ready for COM (common while opening/closing DWGs)
+_RPC_E_CALL_REJECTED = -2147418111
+_RPC_E_SERVERCALL_RETRYLATER = -2147417846
+_COM_BUSY = {_RPC_E_CALL_REJECTED, _RPC_E_SERVERCALL_RETRYLATER}
 
 # #region agent log
 _DEBUG_LOG_PATH = Path(__file__).resolve().parent / ".cursor" / "debug-8178ab.log"
@@ -35,7 +40,7 @@ _DEBUG_LOG_PATH = Path(__file__).resolve().parent / ".cursor" / "debug-8178ab.lo
 def _agent_log(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
     payload = {
         "sessionId": "8178ab",
-        "runId": "post-fix-cross",
+        "runId": "com-retry-4",
         "hypothesisId": hypothesis_id,
         "location": location,
         "message": message,
@@ -57,6 +62,52 @@ def _agent_log(hypothesis_id: str, location: str, message: str, data: dict | Non
 def _acad_point(x: float, y: float, z: float = 0.0):
     """AutoCAD COM points must be VT_ARRAY|VT_R8, not plain Python tuples."""
     return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (float(x), float(y), float(z)))
+
+
+def _com_hresult(ex: BaseException) -> int | None:
+    try:
+        return int(ex.args[0])
+    except Exception:
+        return None
+
+
+def _com_retry(fn, *, retries: int = 50, delay: float = 0.2, label: str = "com"):
+    """Retry when AutoCAD returns CALL_REJECTED / SERVERCALL_RETRYLATER."""
+    last: BaseException | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except Exception as ex:
+            last = ex
+            if _com_hresult(ex) not in _COM_BUSY:
+                raise
+            # #region agent log
+            if attempt == 1 or attempt % 10 == 0:
+                _agent_log(
+                    "H4",
+                    "main.py:_com_retry",
+                    "COM busy, retrying",
+                    {"label": label, "attempt": attempt, "hresult": _com_hresult(ex)},
+                )
+                print(f"  (AutoCAD busy — retry {attempt}/{retries}: {label})")
+            # #endregion
+            try:
+                pythoncom.PumpWaitingMessages()
+            except Exception:
+                pass
+            time.sleep(delay)
+    assert last is not None
+    raise last
+
+
+def _close_doc(doc) -> None:
+    def _do():
+        doc.Close(False)
+
+    try:
+        _com_retry(_do, label="Close")
+    except Exception as ex:
+        print(f"  Warning: Close failed: {ex}")
 
 
 def parse_suffix(dwg_path: Path) -> str:
@@ -92,13 +143,38 @@ def list_dwgs(folder: Path) -> list[Path]:
     return unique
 
 
+class _AcadComMessageFilter:
+    """OLE message filter: auto-retry when AutoCAD rejects a call as busy."""
+
+    def HandleInComingCall(self, dwCallType, hTaskCaller, dwTickCount, lpInterfaceInfo):
+        return 1  # SERVERCALL_ISHANDLED
+
+    def RetryRejectedCall(self, hTaskCallee, dwTickCount, dwRejectType):
+        # Retry for up to ~30s; return milliseconds until next retry
+        if dwTickCount < 30000:
+            return 250
+        return -1  # give up
+
+    def MessagePending(self, hTaskCallee, dwTickCount, dwPendingType):
+        return 2  # PENDINGMSG_WAITDEFPROCESS
+
+
 def get_acad():
+    try:
+        pythoncom.CoRegisterMessageFilter(_AcadComMessageFilter())
+    except Exception:
+        pass
     try:
         acad = win32com.client.GetActiveObject("AutoCAD.Application")
     except Exception:
         acad = win32com.client.Dispatch("AutoCAD.Application")
     acad.Visible = True
-    return acad
+    # Wait until AutoCAD accepts a simple COM call
+    def _ping():
+        _ = acad.Name
+        return acad
+
+    return _com_retry(_ping, label="get_acad", retries=60, delay=0.5)
 
 
 def _is_document(obj) -> bool:
@@ -108,10 +184,11 @@ def _is_document(obj) -> bool:
     if username in ("Open", "Documents", "Application"):
         return False
     try:
-        _ = obj.Layers
         _ = obj.Name
         return True
-    except Exception:
+    except Exception as ex:
+        if _com_hresult(ex) in _COM_BUSY:
+            raise
         return False
 
 
@@ -120,16 +197,59 @@ def open_dwg(acad, path: Path | str, read_only: bool = True):
     Open a DWG and return a real Document.
 
     Late-bound Documents.Open often does not return a Document (win32com leaves
-    the Open method object). Prefer ActiveDocument after Open.
+    the Open method object). Prefer ActiveDocument after Open. Retries when
+    AutoCAD is busy (RPC_E_CALL_REJECTED).
     """
-    path_str = str(path)
-    opened = None
-    try:
-        opened = acad.Documents.Open(path_str, read_only)
-    except Exception:
-        opened = acad.Documents.Open(path_str)
+    path_str = str(Path(path).resolve())
+    expected = Path(path_str).name.lower()
 
-    opened_ok = _is_document(opened)
+    # Reuse if already open (avoids reject while re-opening the same file)
+    def _find_open():
+        docs = acad.Documents
+        for i in range(int(docs.Count)):
+            d = docs.Item(i)
+            try:
+                name = str(d.Name).lower()
+                full = str(getattr(d, "FullName", "")).lower()
+            except Exception:
+                continue
+            if name == expected or full.replace("/", "\\") == path_str.lower():
+                return d
+        return None
+
+    def _existing_doc():
+        d = _find_open()
+        if d is None:
+            return None
+        return d if _is_document(d) else None
+
+    existing = _com_retry(_existing_doc, label="findOpen")
+    if existing is not None:
+        # #region agent log
+        _agent_log(
+            "H5",
+            "main.py:open_dwg",
+            "reusing already-open document",
+            {"path": path_str, "name": str(existing.Name)},
+        )
+        # #endregion
+        try:
+            _com_retry(lambda: existing.Activate(), label="Activate")
+        except Exception:
+            pass
+        return existing
+
+    def _do_open():
+        try:
+            return acad.Documents.Open(path_str, read_only)
+        except Exception:
+            return acad.Documents.Open(path_str)
+
+    opened = _com_retry(_do_open, label="Open")
+    try:
+        opened_ok = _is_document(opened)
+    except Exception:
+        opened_ok = False
     # #region agent log
     _agent_log(
         "H1",
@@ -146,7 +266,45 @@ def open_dwg(acad, path: Path | str, read_only: bool = True):
     if opened_ok:
         return opened
 
-    doc = acad.ActiveDocument
+    # ActiveDocument may reject while AutoCAD finishes loading — retry + name match
+    doc = None
+    for attempt in range(1, 51):
+        try:
+            doc = acad.ActiveDocument
+            if _is_document(doc):
+                name = str(doc.Name).lower()
+                full = str(getattr(doc, "FullName", "")).lower().replace("/", "\\")
+                if name == expected or full == path_str.lower():
+                    break
+                # Wrong active doc — try find by name again
+                found = _find_open()
+                if found is not None and _is_document(found):
+                    doc = found
+                    break
+        except Exception as ex:
+            if _com_hresult(ex) not in _COM_BUSY:
+                raise
+            # #region agent log
+            if attempt == 1 or attempt % 10 == 0:
+                _agent_log(
+                    "H4",
+                    "main.py:open_dwg",
+                    "ActiveDocument busy",
+                    {"path": path_str, "attempt": attempt, "hresult": _com_hresult(ex)},
+                )
+            # #endregion
+            try:
+                pythoncom.PumpWaitingMessages()
+            except Exception:
+                pass
+            time.sleep(0.2)
+            continue
+        try:
+            pythoncom.PumpWaitingMessages()
+        except Exception:
+            pass
+        time.sleep(0.2)
+
     active_ok = _is_document(doc)
     # #region agent log
     _agent_log(
@@ -157,7 +315,7 @@ def open_dwg(acad, path: Path | str, read_only: bool = True):
             "path": path_str,
             "activeOk": active_ok,
             "activeName": str(getattr(doc, "Name", "?")) if active_ok else None,
-            "activeUsername": getattr(doc, "_username_", None),
+            "activeUsername": getattr(doc, "_username_", None) if doc is not None else None,
         },
     )
     # #endregion
@@ -170,14 +328,52 @@ def open_dwg(acad, path: Path | str, read_only: bool = True):
     return doc
 
 
+def _list_layer_names(doc) -> list[str]:
+    """Read layer names with COM-busy retries (Layers.Item often rejects mid-scan)."""
+
+    def _do() -> list[str]:
+        layers = doc.Layers
+        count = int(layers.Count)
+        out: list[str] = []
+        for i in range(count):
+            layer = layers.Item(i)
+            name = str(layer.Name)
+            if name.upper() in ("0", "DEFPOINTS"):
+                continue
+            out.append(name)
+        return out
+
+    return _com_retry(_do, label="Layers.Item", retries=60, delay=0.25)
+
+
 def collect_layer_names(acad, dwg_paths: list[Path]) -> list[str]:
-    """Union of layer names from all source drawings."""
+    """Union of layer names for the picker.
+
+    Only the first two DWGs are opened. Runtime logs showed the layer union
+    stabilizes by file 2 (13 → 15), while opening all 10 triggers CALL_REJECTED
+    mid-scan. Copy still opens every file and matches kept names there.
+    """
     names: set[str] = set()
-    # Step-by-step: scan first drawing for the layer picker (faster).
-    # Kept-layer matching later still works across all files.
-    scan_paths = dwg_paths[:1] if dwg_paths else []
-    for path in scan_paths:
-        doc = open_dwg(acad, path, read_only=True)
+    scan_paths = dwg_paths[:2]
+    print(
+        f"Scanning layers from {len(scan_paths)} of {len(dwg_paths)} drawing(s) "
+        "(enough for the layer list)..."
+    )
+    for idx, path in enumerate(scan_paths, 1):
+        print(f"  [{idx}/{len(scan_paths)}] {path.name}")
+        try:
+            doc = open_dwg(acad, path, read_only=True)
+        except Exception as ex:
+            # #region agent log
+            _agent_log(
+                "H7",
+                "main.py:collect_layer_names",
+                "open failed during layer scan",
+                {"path": str(path.name), "error": repr(ex)},
+            )
+            # #endregion
+            print(f"  Warning: open failed for {path.name}: {ex}")
+            continue
         # #region agent log
         _agent_log(
             "H3",
@@ -192,22 +388,30 @@ def collect_layer_names(acad, dwg_paths: list[Path]) -> list[str]:
         )
         # #endregion
         try:
-            for i in range(doc.Layers.Count):
-                layer = doc.Layers.Item(i)
-                name = str(layer.Name)
-                if name.upper() in ("0", "DEFPOINTS"):
-                    continue
-                names.add(name)
-            # #region agent log
-            _agent_log(
-                "H3",
-                "main.py:collect_layer_names",
-                "layer scan ok",
-                {"layerCount": len(names)},
-            )
-            # #endregion
+            try:
+                for name in _list_layer_names(doc):
+                    names.add(name)
+            except Exception as ex:
+                # #region agent log
+                _agent_log(
+                    "H6",
+                    "main.py:collect_layer_names",
+                    "layer scan failed, skipping file",
+                    {"path": str(path.name), "error": repr(ex)},
+                )
+                # #endregion
+                print(f"  Warning: could not read layers from {path.name}: {ex}")
+            else:
+                # #region agent log
+                _agent_log(
+                    "H3",
+                    "main.py:collect_layer_names",
+                    "layer scan ok",
+                    {"path": str(path.name), "unionCount": len(names)},
+                )
+                # #endregion
         finally:
-            doc.Close(False)
+            _close_doc(doc)
     return sorted(names, key=str.lower)
 
 
@@ -299,24 +503,56 @@ def copy_kept_entities(
     kept_layers: list[str],
     suffix: str,
 ) -> int:
-    """Copy modelspace entities on kept layers into target; rename to layer_suffix."""
+    """Copy kept-layer entities into target with names `{layer}_{suffix}`.
+
+    Renames layers in the open source document in memory, then CopyObjects so
+    the target receives correctly named layers. Closes without saving so the
+    DWG on disk is unchanged.
+    """
     kept_lower = {k.lower() for k in kept_layers}
-    source = open_dwg(acad, source_path, read_only=True)
+    # Writable so layer.Name can be changed; Close(False) discards disk writes.
+    source = open_dwg(acad, source_path, read_only=False)
     copied = 0
     try:
-        layer_map: dict[str, str] = {}
-        for i in range(source.Layers.Count):
-            src_layer = source.Layers.Item(i)
-            src_name = str(src_layer.Name)
+        # Snapshot layer names first — renaming mutates the collection.
+        src_names = _list_layer_names(source)
+        renamed: dict[str, str] = {}  # original -> suffixed
+        for src_name in src_names:
             if src_name.lower() not in kept_lower:
                 continue
-            dst_name = f"{src_name}_{suffix}"
-            layer_map[src_name] = dst_name
+            expected = f"_{suffix}"
+            if src_name.endswith(expected) or src_name.lower().endswith(expected.lower()):
+                dst_name = src_name
+            else:
+                dst_name = f"{src_name}_{suffix}"
+            if dst_name != src_name:
+                try:
+                    # Must not be the current layer when renaming in some AutoCAD builds
+                    try:
+                        if str(source.ActiveLayer.Name) == src_name:
+                            source.ActiveLayer = source.Layers.Item("0")
+                    except Exception:
+                        pass
+                    source.Layers.Item(src_name).Name = dst_name
+                except Exception as ex:
+                    print(f"  Layer rename failed {src_name!r} -> {dst_name!r}: {ex}")
+                    continue
+            renamed[src_name] = dst_name
             ensure_layer(target_doc, dst_name)
 
-        if not layer_map:
+        # #region agent log
+        _agent_log(
+            "L1",
+            "main.py:copy_kept_entities",
+            "source layer rename map",
+            {"file": source_path.name, "suffix": suffix, "renamed": renamed},
+        )
+        # #endregion
+
+        if not renamed:
             return 0
 
+        dst_names = set(renamed.values())
         ms = source.ModelSpace
         to_copy = []
         for i in range(ms.Count):
@@ -325,10 +561,18 @@ def copy_kept_entities(
                 layer_name = str(ent.Layer)
             except Exception:
                 continue
-            if layer_name in layer_map:
+            if layer_name in dst_names:
                 to_copy.append(ent)
 
         if not to_copy:
+            # #region agent log
+            _agent_log(
+                "L2",
+                "main.py:copy_kept_entities",
+                "no entities on renamed layers",
+                {"file": source_path.name, "dstNames": sorted(dst_names)},
+            )
+            # #endregion
             return 0
 
         new_objs: list = []
@@ -349,30 +593,40 @@ def copy_kept_entities(
                 except Exception as ex:
                     print(f"  Skip entity copy error: {ex}")
 
-        for idx, new_ent in enumerate(new_objs):
+        # Entities already carry suffixed layer names from the renamed source.
+        # Soft-verify / correct any that somehow kept an old name.
+        reverse = {v: v for v in renamed.values()}
+        for new_ent in new_objs:
             try:
-                if idx < len(to_copy):
-                    src_layer = str(to_copy[idx].Layer)
-                    dst = layer_map.get(src_layer)
-                    if dst:
-                        new_ent.Layer = dst
+                ln = str(new_ent.Layer)
+                if ln in reverse:
+                    copied += 1
+                    continue
+                # Fallback: map original name if CopyObjects restored it
+                if ln in renamed:
+                    new_ent.Layer = renamed[ln]
                 copied += 1
             except Exception:
                 copied += 1
 
         if not new_objs and to_copy:
-            tms = target_doc.ModelSpace
-            for i in range(tms.Count):
-                ent = tms.Item(i)
-                try:
-                    ln = str(ent.Layer)
-                    if ln in layer_map:
-                        ent.Layer = layer_map[ln]
-                        copied += 1
-                except Exception:
-                    pass
+            copied = len(to_copy)
+
+        # #region agent log
+        _agent_log(
+            "L2",
+            "main.py:copy_kept_entities",
+            "copy complete",
+            {
+                "file": source_path.name,
+                "suffix": suffix,
+                "entityCount": copied,
+                "layers": sorted(set(renamed.values())),
+            },
+        )
+        # #endregion
     finally:
-        source.Close(False)
+        _close_doc(source)
 
     return copied
 
@@ -457,12 +711,14 @@ def draw_origin_cross(doc, easting: float, northing: float) -> None:
 
 def main() -> int:
     print("AutoCAD layer combine")
-    print("Uses AutoCAD COM. Packages must be installed in project .venv only.\n")
+    print("Uses AutoCAD COM. Packages must be installed in project .venv only.")
+    print(f"Build: {BUILD_ID} (layer picker scans 2 DWGs only)")
+    print(f"Script: {Path(__file__).resolve()}\n")
     # #region agent log
     _agent_log(
         "H0",
         "main.py:main",
-        "run start A+B build",
+        f"run start {BUILD_ID}",
         {"script": str(Path(__file__).resolve()), "py": sys.version.split()[0]},
     )
     # #endregion
@@ -483,7 +739,6 @@ def main() -> int:
     print("\nStarting AutoCAD (if not already running)...")
     acad = get_acad()
 
-    print("Scanning layers (opening drawings read-only)...")
     available = collect_layer_names(acad, dwgs)
     if not available:
         print("No layers found in the drawings.")
