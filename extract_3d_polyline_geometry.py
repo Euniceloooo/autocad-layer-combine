@@ -1,17 +1,21 @@
 """
-Extract 3D polyline vertices from one AutoCAD DWG into per-polyline CSV files.
+Extract 3D polyline vertices from one AutoCAD DWG into per-layer CSV files.
 
-Each AcDb3dPolyline becomes `{Handle}_Geometry.csv` with columns:
-  vertex,x,y,z
+Each AcDb3dPolyline (model space or inside block inserts) becomes
+`{Layer}_Geometry.csv` with columns: vertex,x,y,z
 
+Assumes one 3D polyline per layer; warns and skips if a layer has more than one.
 Requires AutoCAD installed. Run from the project .venv only.
 """
 
 from __future__ import annotations
 
 import csv
+import math
 import sys
 import time
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -29,8 +33,9 @@ _RPC_E_CALL_REJECTED = -2147418111
 _RPC_E_SERVERCALL_RETRYLATER = -2147417846
 _COM_BUSY = {_RPC_E_CALL_REJECTED, _RPC_E_SERVERCALL_RETRYLATER}
 
-# AutoCAD entity ObjectName for 3D polylines
 OBJ_3DPOLY = "AcDb3dPolyline"
+OBJ_BLOCK_REF = "AcDbBlockReference"
+_MAX_BLOCK_DEPTH = 8
 
 
 def _com_hresult(ex: BaseException) -> int | None:
@@ -266,39 +271,210 @@ def _entity_vertices(ent) -> list[tuple[float, float, float]]:
         return []
 
 
-def find_3d_polylines(doc) -> list[tuple[str, object, list[tuple[float, float, float]]]]:
-    """Return list of (handle, entity, vertices) for AcDb3dPolyline in model space."""
+@dataclass
+class FoundPoly:
+    layer: str
+    handle: str
+    vertices: list[tuple[float, float, float]]
+    source: str
 
-    def _scan():
-        ms = doc.ModelSpace
-        count = int(ms.Count)
-        found: list[tuple[str, object, list[tuple[float, float, float]]]] = []
-        for i in range(count):
-            ent = ms.Item(i)
+
+def _safe_filename(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name) or "layer"
+
+
+def _as_xyz(pt) -> tuple[float, float, float]:
+    try:
+        return float(pt[0]), float(pt[1]), float(pt[2])
+    except Exception:
+        return float(pt.X), float(pt.Y), float(pt.Z)
+
+
+def _block_ref_name(bref) -> str:
+    for attr in ("EffectiveName", "Name"):
+        try:
+            name = str(getattr(bref, attr))
+            if name:
+                return name
+        except Exception:
+            continue
+    return ""
+
+
+def _transform_from_block_ref(bref):
+    """Return f(x,y,z)->WCS for a typical insert (scale + Z rotation + insertion)."""
+    ins = _as_xyz(bref.InsertionPoint)
+    try:
+        sx = float(bref.XScaleFactor)
+        sy = float(bref.YScaleFactor)
+        sz = float(bref.ZScaleFactor)
+    except Exception:
+        sx = sy = sz = 1.0
+    try:
+        rot = float(bref.Rotation)  # radians
+    except Exception:
+        rot = 0.0
+    cos_r = math.cos(rot)
+    sin_r = math.sin(rot)
+
+    # If Normal is not world Z, build a simple orthonormal frame (OCS → WCS)
+    try:
+        nx, ny, nz = _as_xyz(bref.Normal)
+    except Exception:
+        nx, ny, nz = 0.0, 0.0, 1.0
+    nlen = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+    nx, ny, nz = nx / nlen, ny / nlen, nz / nlen
+    world_z = abs(nx) < 1e-9 and abs(ny) < 1e-9 and abs(nz - 1.0) < 1e-6
+
+    if world_z:
+
+        def _map(x: float, y: float, z: float) -> tuple[float, float, float]:
+            x1, y1, z1 = x * sx, y * sy, z * sz
+            xr = x1 * cos_r - y1 * sin_r
+            yr = x1 * sin_r + y1 * cos_r
+            return (xr + ins[0], yr + ins[1], z1 + ins[2])
+
+        return _map
+
+    # Arbitrary normal: Azimuth/Elevation style axes (AutoCAD OCS)
+    # Arbitrary axis algorithm (simplified)
+    if abs(nx) < 1.0 / 64.0 and abs(ny) < 1.0 / 64.0:
+        ax, ay, az = nz, 0.0, -nx
+    else:
+        ax, ay, az = -ny, nx, 0.0
+    alen = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+    ax, ay, az = ax / alen, ay / alen, az / alen
+    bx = ny * az - nz * ay
+    by = nz * ax - nx * az
+    bz = nx * ay - ny * ax
+
+    def _map(x: float, y: float, z: float) -> tuple[float, float, float]:
+        x1, y1, z1 = x * sx, y * sy, z * sz
+        xr = x1 * cos_r - y1 * sin_r
+        yr = x1 * sin_r + y1 * cos_r
+        zr = z1
+        X = ax * xr + bx * yr + nx * zr + ins[0]
+        Y = ay * xr + by * yr + ny * zr + ins[1]
+        Z = az * xr + bz * yr + nz * zr + ins[2]
+        return (X, Y, Z)
+
+    return _map
+
+
+def _compose_transforms(outer, inner):
+    def _map(x: float, y: float, z: float) -> tuple[float, float, float]:
+        return outer(*inner(x, y, z))
+
+    return _map
+
+
+def _identity_transform():
+    def _map(x: float, y: float, z: float) -> tuple[float, float, float]:
+        return (x, y, z)
+
+    return _map
+
+
+def _apply_transform(
+    verts: list[tuple[float, float, float]],
+    xform,
+) -> list[tuple[float, float, float]]:
+    return [xform(x, y, z) for x, y, z in verts]
+
+
+def _scan_container(
+    doc,
+    container,
+    *,
+    xform,
+    source: str,
+    depth: int,
+    visiting: set[str],
+    found: list[FoundPoly],
+) -> None:
+    """Scan a ModelSpace / Block for 3D polys and nested block refs."""
+    try:
+        count = int(container.Count)
+    except Exception:
+        return
+    for i in range(count):
+        try:
+            ent = container.Item(i)
+            obj_name = str(ent.ObjectName)
+        except Exception:
+            continue
+
+        if obj_name == OBJ_3DPOLY:
             try:
-                obj_name = str(ent.ObjectName)
+                layer = str(ent.Layer)
             except Exception:
-                continue
-            if obj_name != OBJ_3DPOLY:
-                continue
+                layer = "0"
             try:
                 handle = str(ent.Handle)
             except Exception:
                 handle = f"IDX{i}"
-            verts = _entity_vertices(ent)
-            found.append((handle, ent, verts))
+            local = _entity_vertices(ent)
+            verts = _apply_transform(local, xform) if local else []
+            found.append(
+                FoundPoly(layer=layer, handle=handle, vertices=verts, source=source)
+            )
+            continue
+
+        if obj_name != OBJ_BLOCK_REF or depth >= _MAX_BLOCK_DEPTH:
+            continue
+
+        bname = _block_ref_name(ent)
+        # Skip unnamed / anonymous blocks (*U, *D, *Model_Space, etc.)
+        if not bname or bname.startswith("*"):
+            continue
+        if bname in visiting:
+            continue
+
+        try:
+            block_def = doc.Blocks.Item(bname)
+        except Exception:
+            continue
+
+        child_xform = _compose_transforms(xform, _transform_from_block_ref(ent))
+        visiting.add(bname)
+        _scan_container(
+            doc,
+            block_def,
+            xform=child_xform,
+            source=f"block:{bname}" if source == "model" else f"{source}/{bname}",
+            depth=depth + 1,
+            visiting=visiting,
+            found=found,
+        )
+        visiting.discard(bname)
+
+
+def find_3d_polylines(doc) -> list[FoundPoly]:
+    """Find AcDb3dPolyline in model space and inside block inserts (WCS)."""
+
+    def _scan() -> list[FoundPoly]:
+        found: list[FoundPoly] = []
+        _scan_container(
+            doc,
+            doc.ModelSpace,
+            xform=_identity_transform(),
+            source="model",
+            depth=0,
+            visiting=set(),
+            found=found,
+        )
         return found
 
-    return _com_retry(_scan, label="ModelSpace.scan", retries=40, delay=0.25)
+    return _com_retry(_scan, label="ModelSpace+blocks.scan", retries=40, delay=0.25)
 
 
 def write_geometry_csv(
     out_folder: Path,
-    handle: str,
+    layer_name: str,
     vertices: list[tuple[float, float, float]],
 ) -> Path:
-    safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in handle)
-    out_path = out_folder / f"{safe_id}_Geometry.csv"
+    safe = _safe_filename(layer_name)
+    out_path = out_folder / f"{safe}_Geometry.csv"
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["vertex", "x", "y", "z"])
@@ -323,25 +499,56 @@ def main() -> int:
     doc = open_dwg(acad, dwg, read_only=True)
 
     try:
-        print("Scanning model space for AcDb3dPolyline...")
+        print("Scanning model space + block inserts for AcDb3dPolyline...")
         polylines = find_3d_polylines(doc)
         if not polylines:
-            print("No 3D polylines (AcDb3dPolyline) found in model space.")
+            print("No 3D polylines (AcDb3dPolyline) found.")
             return 1
 
-        print(f"Found {len(polylines)} 3D polyline(s). Exporting one CSV per Handle...\n")
-        print(f"{'Handle':<16} {'Vertices':>8}  Output")
-        print("-" * 72)
+        by_layer: dict[str, list[FoundPoly]] = defaultdict(list)
+        for poly in polylines:
+            by_layer[poly.layer].append(poly)
 
-        for handle, _ent, verts in polylines:
-            if not verts:
-                print(f"{handle:<16} {0:>8}  (skipped — no coordinates)")
+        print(
+            f"Found {len(polylines)} 3D polyline(s) across {len(by_layer)} layer(s).\n"
+        )
+        print(f"{'Layer':<28} {'Polys':>5} {'Verts':>8}  Status")
+        print("-" * 78)
+
+        exported = 0
+        skipped = 0
+        for layer in sorted(by_layer.keys(), key=str.lower):
+            items = by_layer[layer]
+            if len(items) > 1:
+                handles = ", ".join(p.handle for p in items)
+                sources = ", ".join(sorted({p.source for p in items}))
+                print(
+                    f"{layer:<28} {len(items):>5} {'-':>8}  "
+                    f"WARNING: >1 3D polyline — skipped "
+                    f"(handles={handles}; sources={sources})"
+                )
+                skipped += 1
                 continue
-            out_path = write_geometry_csv(out_folder, handle, verts)
-            print(f"{handle:<16} {len(verts):>8}  {out_path}")
 
-        print(f"\nDone. CSV files in: {out_folder}")
-        return 0
+            poly = items[0]
+            if not poly.vertices:
+                print(
+                    f"{layer:<28} {1:>5} {0:>8}  skipped — no coordinates "
+                    f"({poly.source}, handle={poly.handle})"
+                )
+                skipped += 1
+                continue
+
+            out_path = write_geometry_csv(out_folder, layer, poly.vertices)
+            print(
+                f"{layer:<28} {1:>5} {len(poly.vertices):>8}  {out_path.name} "
+                f"[{poly.source}]"
+            )
+            exported += 1
+
+        print(f"\nExported {exported} CSV(s); skipped {skipped} layer(s).")
+        print(f"Output folder: {out_folder}")
+        return 0 if exported > 0 else 1
     finally:
         _close_doc(doc)
 

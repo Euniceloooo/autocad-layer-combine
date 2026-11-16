@@ -49,7 +49,7 @@ You will be prompted for:
 
 ## 3D polyline geometry export
 
-Export each `AcDb3dPolyline` in one DWG to its own CSV (by AutoCAD object Handle).
+Export each `AcDb3dPolyline` in one DWG to a CSV named by **layer**. Finds polylines in model space and inside **block inserts** (vertices transformed to WCS).
 
 ```bat
 RUN_EXTRACT_GEOMETRY.bat
@@ -67,7 +67,7 @@ Prompts:
 1. Path to a single `.dwg`
 2. Output folder (default: same folder as the DWG)
 
-For each 3D polyline, writes `{Handle}_Geometry.csv`:
+For each layer with exactly one 3D polyline, writes `{Layer}_Geometry.csv`:
 
 ```csv
 vertex,x,y,z
@@ -75,6 +75,6 @@ vertex,x,y,z
 2,...
 ```
 
-Coordinates are **HK Grid metres**, rounded to **4 decimal places** (0.1 mm) to keep survey accuracy while trimming CAD float noise.
+Coordinates are **HK Grid metres**, rounded to **4 decimal places** (0.1 mm).
 
-Multiple 3D polylines in one drawing are processed one by one (one CSV each).
+**One 3D polyline per layer** is expected. If a layer has more than one (including from blocks), the tool prints a **warning** and **skips** that layer (no CSV).
