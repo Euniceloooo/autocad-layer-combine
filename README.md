@@ -46,3 +46,35 @@ You will be prompted for:
 
 - Suffix is stored as `TLC01` (no leading `_`); rename uses `f"{layer}_{suffix}"`.
 - Origin mark: 1 m horizontal + 1 m vertical cross centered on `(E, N, 0)`, plus a text label `ORIGIN E=... N=... Z=0` on layer `ORIGIN_MARK`.
+
+## 3D polyline geometry export
+
+Export each `AcDb3dPolyline` in one DWG to its own CSV (by AutoCAD object Handle).
+
+```bat
+RUN_EXTRACT_GEOMETRY.bat
+```
+
+Or:
+
+```bat
+.venv\Scripts\activate.bat
+python extract_3d_polyline_geometry.py
+```
+
+Prompts:
+
+1. Path to a single `.dwg`
+2. Output folder (default: same folder as the DWG)
+
+For each 3D polyline, writes `{Handle}_Geometry.csv`:
+
+```csv
+vertex,x,y,z
+1,821704.4910,824308.5050,12.3000
+2,...
+```
+
+Coordinates are **HK Grid metres**, rounded to **4 decimal places** (0.1 mm) to keep survey accuracy while trimming CAD float noise.
+
+Multiple 3D polylines in one drawing are processed one by one (one CSV each).
