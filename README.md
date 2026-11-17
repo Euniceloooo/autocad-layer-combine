@@ -1,24 +1,23 @@
 # autocad-layer-combine
 
-Combine selected layers from multiple AutoCAD DWG files into one drawing.
-Each source file’s trailing token (e.g. `TLC01`) is appended to kept layer names
-as `{layer}_{suffix}`. A 1 m origin cross is drawn at a user-supplied E/N (metres).
+Windows tools that use **AutoCAD COM** (via project `.venv` + `pywin32`):
+
+1. **Layer combine** — merge selected layers from many DWGs, rename by file suffix, mark origin.
+2. **3D polyline geometry export** — CSV per layer (HK Grid + local-offset for Revit adaptive families).
 
 ## Requirements
 
-- Windows with **AutoCAD** installed (COM automation)
-- Project **`.venv`** only — do not install packages into system Python
+- Windows with **AutoCAD** installed
+- Project **`.venv` only** — do not install packages into system Python
 
 ## Setup
-
-Install into the project `.venv` only (not system Python):
 
 ```bat
 cd c:\Users\Eunice.Lo\github\autocad-layer-combine
 install_deps.bat
 ```
 
-Or manually:
+Or:
 
 ```bat
 python -m venv .venv
@@ -26,65 +25,78 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run
+## Local origin (not on GitHub)
 
-With AutoCAD available on the machine:
-
-```bat
-.venv\Scripts\activate.bat
-python main.py
-```
-
-You will be prompted for:
-
-1. Folder containing DWGs (e.g. `..._CHAINAGES_TLC01.dwg`)
-2. Layer name(s) to keep (comma-separated)
-3. Origin Easting / Northing in **metres** (Z = 0) — skipped if `origin.local.json` exists
-4. Output path (default: `combined_layers.dwg` in that folder)
-
-### Local origin (not on GitHub)
-
-Copy the template and fill in your HK Grid origin (metres):
+Both tools can use a fixed HK Grid origin from a **gitignored** file:
 
 ```bat
 copy origin.example.json origin.local.json
 ```
 
-Edit `origin.local.json` with your `easting`, `northing`, and `elevation`. That file is **gitignored** so real E/N are not pushed to GitHub. When it is present, `main.py` uses it automatically and does not ask for E/N.
+Edit `origin.local.json`:
 
-## Notes
+```json
+{
+  "easting": 0.0,
+  "northing": 0.0,
+  "elevation": 0.0
+}
+```
 
-- Suffix is stored as `TLC01` (no leading `_`); rename uses `f"{layer}_{suffix}"`.
-- Origin mark: 1 m horizontal + 1 m vertical cross centered on `(E, N, 0)`, plus a text label `ORIGIN E=... N=... Z=0` on layer `ORIGIN_MARK`.
+Real E/N stay off GitHub. Geometry export **requires** this file (for the adaptive CSV). Layer combine uses it to skip typing E/N when present.
 
-## 3D polyline geometry export
+---
 
-Export each `AcDb3dPolyline` in one DWG to a CSV named by **layer**. Finds polylines in model space and inside **block inserts** (vertices transformed to WCS).
+## 1. Layer combine
+
+```bat
+RUN_MAIN.bat
+```
+
+Or: `.venv\Scripts\python.exe -u main.py`
+
+Prompts:
+
+1. Folder containing DWGs (e.g. `..._CHAINAGES_TLC01.dwg`)
+2. Layer name(s) to keep (comma-separated)
+3. Origin E/N in metres — **skipped** if `origin.local.json` exists
+4. Output path (default: `combined_layers.dwg` in that folder)
+
+Behaviour:
+
+- Suffix from the last `_` token of each filename (e.g. `TLC01`, `TMR-EB`)
+- Kept layers become `{layer}_{suffix}`
+- Draws a 1 m origin cross + text `ORIGIN E=... N=... Z=0` on layer `ORIGIN_MARK`
+
+---
+
+## 2. 3D polyline geometry export
 
 ```bat
 RUN_EXTRACT_GEOMETRY.bat
 ```
 
-Or:
+Or: `.venv\Scripts\python.exe -u extract_3d_polyline_geometry.py`
 
-```bat
-.venv\Scripts\activate.bat
-python extract_3d_polyline_geometry.py
-```
-
-Requires `origin.local.json` (copy from `origin.example.json`) for the adaptive offset.
+Requires `origin.local.json` first (see above).
 
 Prompts:
 
 1. Path to a single `.dwg`
 2. Output folder (default: same folder as the DWG)
 
-For each layer with exactly one 3D polyline, writes **two** CSVs:
+Finds `AcDb3dPolyline` in **model space** and inside **block inserts** (vertices to WCS).
+
+**One 3D polyline per layer** is expected. If a layer has more than one, the tool **warns and skips** that layer.
+
+For each OK layer, writes **two** CSVs (coordinates in metres, **4 decimal places** = 0.1 mm):
 
 | File | Coordinates |
 |------|-------------|
-| `{Layer}_Geometry.csv` | HK Grid absolute (metres) |
+| `{Layer}_Geometry.csv` | HK Grid absolute |
 | `{Layer}_Geometry for adaptive.csv` | Local: `x−E0`, `y−N0`, `z−Z0` from `origin.local.json` |
+
+Example adaptive row (near origin):
 
 ```csv
 vertex,x,y,z
@@ -92,6 +104,4 @@ vertex,x,y,z
 2,...
 ```
 
-Values are rounded to **4 decimal places** (0.1 mm). Use the adaptive CSV for Revit adaptive-family Reference Points (near origin).
-
-**One 3D polyline per layer** is expected. If a layer has more than one (including from blocks), the tool prints a **warning** and **skips** that layer (no CSV).
+Use `*_Geometry for adaptive.csv` when placing Reference Points in a Revit adaptive family (values near 0, not ~820000).
