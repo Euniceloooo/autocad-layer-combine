@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local HK Grid origin (do not commit real E/N)
+origin.local.json

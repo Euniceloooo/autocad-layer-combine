@@ -39,8 +39,18 @@ You will be prompted for:
 
 1. Folder containing DWGs (e.g. `..._CHAINAGES_TLC01.dwg`)
 2. Layer name(s) to keep (comma-separated)
-3. Origin Easting / Northing in **metres** (Z = 0)
+3. Origin Easting / Northing in **metres** (Z = 0) — skipped if `origin.local.json` exists
 4. Output path (default: `combined_layers.dwg` in that folder)
+
+### Local origin (not on GitHub)
+
+Copy the template and fill in your HK Grid origin (metres):
+
+```bat
+copy origin.example.json origin.local.json
+```
+
+Edit `origin.local.json` with your `easting`, `northing`, and `elevation`. That file is **gitignored** so real E/N are not pushed to GitHub. When it is present, `main.py` uses it automatically and does not ask for E/N.
 
 ## Notes
 

@@ -448,10 +448,42 @@ def prompt_layers_to_keep(available: list[str]) -> list[str]:
         return kept
 
 
+_ORIGIN_LOCAL = Path(__file__).resolve().parent / "origin.local.json"
+
+
+def load_origin_local() -> tuple[float, float, float] | None:
+    """Load E/N/Z from gitignored origin.local.json if present."""
+    if not _ORIGIN_LOCAL.is_file():
+        return None
+    try:
+        data = json.loads(_ORIGIN_LOCAL.read_text(encoding="utf-8"))
+        e = float(data["easting"])
+        n = float(data["northing"])
+        z = float(data.get("elevation", 0.0))
+        return e, n, z
+    except Exception as ex:
+        print(f"Warning: could not read {_ORIGIN_LOCAL.name}: {ex}")
+        return None
+
+
 def prompt_origin() -> tuple[float, float]:
+    """Return E/N for the origin mark. Prefers origin.local.json when present."""
+    loaded = load_origin_local()
+    if loaded is not None:
+        e, n, z = loaded
+        print(
+            f"\nUsing origin from {_ORIGIN_LOCAL.name}: "
+            f"E={e}  N={n}  Z={z} (cross uses Z=0)"
+        )
+        return e, n
+
     print(
         "\nOrigin mark (1 m cross). Enter Easting (E) and Northing (N) in METRES. "
         "Z will be 0. CAD units should already be metres."
+    )
+    print(
+        f"(Tip: copy origin.example.json → {_ORIGIN_LOCAL.name} to skip this prompt; "
+        "that file is gitignored.)"
     )
     while True:
         try:
