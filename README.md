@@ -72,19 +72,26 @@ Or:
 python extract_3d_polyline_geometry.py
 ```
 
+Requires `origin.local.json` (copy from `origin.example.json`) for the adaptive offset.
+
 Prompts:
 
 1. Path to a single `.dwg`
 2. Output folder (default: same folder as the DWG)
 
-For each layer with exactly one 3D polyline, writes `{Layer}_Geometry.csv`:
+For each layer with exactly one 3D polyline, writes **two** CSVs:
+
+| File | Coordinates |
+|------|-------------|
+| `{Layer}_Geometry.csv` | HK Grid absolute (metres) |
+| `{Layer}_Geometry for adaptive.csv` | Local: `x−E0`, `y−N0`, `z−Z0` from `origin.local.json` |
 
 ```csv
 vertex,x,y,z
-1,821704.4910,824308.5050,12.3000
+1,2.9990,0.0000,12.3000
 2,...
 ```
 
-Coordinates are **HK Grid metres**, rounded to **4 decimal places** (0.1 mm).
+Values are rounded to **4 decimal places** (0.1 mm). Use the adaptive CSV for Revit adaptive-family Reference Points (near origin).
 
 **One 3D polyline per layer** is expected. If a layer has more than one (including from blocks), the tool prints a **warning** and **skips** that layer (no CSV).

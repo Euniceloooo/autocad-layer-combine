@@ -1,8 +1,9 @@
 """
 Extract 3D polyline vertices from one AutoCAD DWG into per-layer CSV files.
 
-Each AcDb3dPolyline (model space or inside block inserts) becomes
-`{Layer}_Geometry.csv` with columns: vertex,x,y,z
+Each AcDb3dPolyline (model space or inside block inserts) becomes:
+  `{Layer}_Geometry.csv` — HK Grid absolute (metres)
+  `{Layer}_Geometry for adaptive.csv` — local = point − origin.local.json
 
 Assumes one 3D polyline per layer; warns and skips if a layer has more than one.
 Requires AutoCAD installed. Run from the project .venv only.
@@ -11,6 +12,7 @@ Requires AutoCAD installed. Run from the project .venv only.
 from __future__ import annotations
 
 import csv
+import json
 import math
 import sys
 import time
@@ -36,6 +38,8 @@ _COM_BUSY = {_RPC_E_CALL_REJECTED, _RPC_E_SERVERCALL_RETRYLATER}
 OBJ_3DPOLY = "AcDb3dPolyline"
 OBJ_BLOCK_REF = "AcDbBlockReference"
 _MAX_BLOCK_DEPTH = 8
+_ORIGIN_LOCAL = Path(__file__).resolve().parent / "origin.local.json"
+_ADAPTIVE_SUFFIX = "Geometry for adaptive"
 
 
 def _com_hresult(ex: BaseException) -> int | None:
@@ -468,18 +472,55 @@ def find_3d_polylines(doc) -> list[FoundPoly]:
     return _com_retry(_scan, label="ModelSpace+blocks.scan", retries=40, delay=0.25)
 
 
+def load_origin_local() -> tuple[float, float, float] | None:
+    """Load E0/N0/Z0 from gitignored origin.local.json if present."""
+    if not _ORIGIN_LOCAL.is_file():
+        return None
+    try:
+        data = json.loads(_ORIGIN_LOCAL.read_text(encoding="utf-8"))
+        e = float(data["easting"])
+        n = float(data["northing"])
+        z = float(data.get("elevation", 0.0))
+        return e, n, z
+    except Exception as ex:
+        print(f"Warning: could not read {_ORIGIN_LOCAL.name}: {ex}")
+        return None
+
+
+def require_origin_local() -> tuple[float, float, float]:
+    loaded = load_origin_local()
+    if loaded is None:
+        print(
+            f"Missing {_ORIGIN_LOCAL.name} (needed for adaptive local-offset CSV).\n"
+            "Copy origin.example.json → origin.local.json and set easting/northing/elevation.\n"
+            "That file is gitignored so real E/N stay off GitHub."
+        )
+        raise SystemExit(1)
+    return loaded
+
+
+def _offset_vertices(
+    vertices: list[tuple[float, float, float]],
+    origin: tuple[float, float, float],
+) -> list[tuple[float, float, float]]:
+    e0, n0, z0 = origin
+    return [(x - e0, y - n0, z - z0) for x, y, z in vertices]
+
+
 def write_geometry_csv(
     out_folder: Path,
     layer_name: str,
     vertices: list[tuple[float, float, float]],
+    *,
+    name_suffix: str = "Geometry",
 ) -> Path:
     safe = _safe_filename(layer_name)
-    out_path = out_folder / f"{safe}_Geometry.csv"
+    out_path = out_folder / f"{safe}_{name_suffix}.csv"
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["vertex", "x", "y", "z"])
         for idx, (x, y, z) in enumerate(vertices, start=1):
-            # HK Grid metres: 4 dp = 0.1 mm (keeps accuracy, trims CAD float noise)
+            # Metres: 4 dp = 0.1 mm (keeps accuracy, trims CAD float noise)
             writer.writerow(
                 [idx, f"{round(x, 4):.4f}", f"{round(y, 4):.4f}", f"{round(z, 4):.4f}"]
             )
@@ -489,6 +530,10 @@ def write_geometry_csv(
 def main() -> int:
     print("AutoCAD 3D polyline geometry export")
     print("Uses AutoCAD COM. Packages must be installed in project .venv only.\n")
+
+    origin = require_origin_local()
+    e0, n0, z0 = origin
+    print(f"Adaptive origin from {_ORIGIN_LOCAL.name}: E0={e0}  N0={n0}  Z0={z0}")
 
     dwg = prompt_dwg_path()
     out_folder = prompt_output_folder(dwg.parent)
@@ -539,14 +584,25 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            out_path = write_geometry_csv(out_folder, layer, poly.vertices)
+            abs_path = write_geometry_csv(out_folder, layer, poly.vertices)
+            local_verts = _offset_vertices(poly.vertices, origin)
+            adapt_path = write_geometry_csv(
+                out_folder,
+                layer,
+                local_verts,
+                name_suffix=_ADAPTIVE_SUFFIX,
+            )
             print(
-                f"{layer:<28} {1:>5} {len(poly.vertices):>8}  {out_path.name} "
-                f"[{poly.source}]"
+                f"{layer:<28} {1:>5} {len(poly.vertices):>8}  "
+                f"{abs_path.name} + {adapt_path.name} [{poly.source}]"
             )
             exported += 1
 
-        print(f"\nExported {exported} CSV(s); skipped {skipped} layer(s).")
+        print(
+            f"\nExported {exported} layer(s) "
+            f"(2 CSVs each: Geometry + Geometry for adaptive); "
+            f"skipped {skipped} layer(s)."
+        )
         print(f"Output folder: {out_folder}")
         return 0 if exported > 0 else 1
     finally:
